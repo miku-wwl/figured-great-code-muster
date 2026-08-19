@@ -53,6 +53,20 @@ class BankTransactionSuggestionTest extends TestCase
         $this->assertTransactionRemainsUncoded();
     }
 
+    public function test_an_already_coded_transaction_is_never_reclassified(): void
+    {
+        $fuel = Category::where('name', 'Fuel')->firstOrFail();
+        $this->transaction->update(['category_id' => $fuel->id]);
+        Http::fake();
+
+        $this->postJson($this->suggestionUrl())
+            ->assertStatus(422)
+            ->assertJsonPath('error', 'Only uncoded transactions can receive a suggestion.');
+
+        Http::assertNothingSent();
+        $this->assertSame($fuel->id, $this->transaction->fresh()->category_id);
+    }
+
     public function test_low_confidence_output_needs_review_without_being_saved(): void
     {
         config(['services.anthropic.review_confidence_threshold' => 0.95]);
