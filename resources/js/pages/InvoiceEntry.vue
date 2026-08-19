@@ -4,6 +4,8 @@ import { computed, onMounted, ref } from 'vue';
 import { money } from '../format';
 
 const invoices = ref([]);
+const bankTransactions = ref([]);
+const bankCategories = ref([]);
 const categories = ref([]);
 const selected = ref(null);
 const loading = ref(true);
@@ -15,6 +17,9 @@ const aiDrafts = ref({});
 const aiError = ref('');
 const aiWarnings = ref([]);
 const aiConfidence = ref(null);
+const checkingBank = ref(false);
+const bankCheckProgress = ref({ completed: 0, total: 0 });
+const bankCheckResults = ref({});
 
 // The entry form being filled in for the selected invoice.
 const form = ref(emptyForm());
@@ -30,9 +35,14 @@ function emptyForm() {
 }
 
 onMounted(async () => {
-    const { data } = await axios.get('/api/invoices');
-    invoices.value = data.invoices;
-    categories.value = data.categories;
+    const [{ data: invoiceData }, { data: bankData }] = await Promise.all([
+        axios.get('/api/invoices'),
+        axios.get('/api/bank-transactions'),
+    ]);
+    invoices.value = invoiceData.invoices;
+    categories.value = invoiceData.categories;
+    bankTransactions.value = bankData.transactions;
+    bankCategories.value = bankData.categories;
     loading.value = false;
 });
 
@@ -205,13 +215,14 @@ ${invoice.raw_text}`,
 }
 
 async function extractAllWithAi() {
-    if (extracting.value || !invoices.value.length) return;
+    const pendingInvoices = invoices.value.filter((invoice) => !invoice.reviewed_at);
+    if (extracting.value || !pendingInvoices.length) return;
 
     extracting.value = true;
     aiError.value = '';
-    extractionProgress.value = { completed: 0, total: invoices.value.length };
+    extractionProgress.value = { completed: 0, total: pendingInvoices.length };
 
-    for (const invoice of invoices.value) {
+    for (const invoice of pendingInvoices) {
         aiDrafts.value[invoice.id] = await extractInvoice(invoice);
         extractionProgress.value.completed += 1;
     }
@@ -224,6 +235,118 @@ async function extractAllWithAi() {
     } else if (!selected.value) {
         open(invoices.value.find((invoice) => !invoice.entered_at) ?? invoices.value[0]);
     }
+}
+
+function bankCandidates(invoice) {
+    const supplierWords = String(invoice.supplier ?? '')
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter((word) => word.length >= 4);
+    const total = Math.abs(Number(invoice.total));
+
+    return bankTransactions.value.filter((transaction) => {
+        const description = transaction.description.toLowerCase();
+        const supplierMatch = supplierWords.some((word) => description.includes(word));
+        const amountMatch = Number.isFinite(total) && Math.abs(Math.abs(transaction.amount) - total) <= Math.max(25, total * 0.05);
+        return supplierMatch || amountMatch;
+    });
+}
+
+async function checkBankCoding(invoice) {
+    try {
+        const candidates = bankCandidates(invoice);
+        const categoryNames = bankCategories.value.map((category) => category.name).join(', ');
+        const { data } = await axios.post('/api/ai', {
+            system: 'You reconcile reviewed supplier invoices against bank transactions. Return valid JSON only, with no markdown or explanation.',
+            prompt: `Check whether this reviewed invoice matches one of the candidate bank transactions and whether the bank category is consistent with the invoice category.
+
+Rules:
+- Return JSON only.
+- Match by supplier clues, amount, and date; do not invent a transaction id.
+- Only recommend a correction when the match is clear and confidence is high.
+- If the bank category is inconsistent, recommended_category_name must equal the reviewed invoice category.
+- category_name must be one of: ${categoryNames}.
+
+Return exactly:
+{
+  "match_found": boolean,
+  "transaction_id": number|null,
+  "current_category_name": string|null,
+  "invoice_category_name": string|null,
+  "category_consistent": boolean|null,
+  "recommended_category_name": string|null,
+  "confidence": "high"|"medium"|"low",
+  "reason": string
+}
+
+Reviewed invoice:
+${JSON.stringify({
+    supplier: invoice.supplier,
+    invoice_date: invoice.invoice_date,
+    total: invoice.total,
+    category_name: categories.value.find((category) => category.id === invoice.category_id)?.name ?? null,
+})}
+
+Candidate bank transactions:
+${JSON.stringify(candidates)}`,
+        });
+
+        const result = parseAiJson(data.text);
+        const transaction = bankTransactions.value.find((item) => item.id === Number(result.transaction_id));
+        const invoiceCategory = categories.value.find((category) => category.id === invoice.category_id);
+        const recommendedCategory = result.category_consistent === false
+            ? invoiceCategory
+            : bankCategories.value.find(
+                  (category) => category.name.toLowerCase() === String(result.recommended_category_name ?? '').toLowerCase(),
+              );
+        const canAutoCorrect = Boolean(
+            transaction &&
+                recommendedCategory &&
+                result.match_found &&
+                result.category_consistent === false &&
+                result.confidence === 'high',
+        );
+
+        if (canAutoCorrect) {
+            const { data: updated } = await axios.patch(`/api/bank-transactions/${transaction.id}`, {
+                category_id: recommendedCategory.id,
+            });
+            Object.assign(transaction, updated);
+        }
+
+        bankCheckResults.value[invoice.id] = {
+            ...result,
+            transaction,
+            autoCorrected: canAutoCorrect,
+            recommendedCategory,
+            error: null,
+        };
+    } catch (error) {
+        bankCheckResults.value[invoice.id] = {
+            error: error.response?.data?.error ?? error.message ?? 'Bank coding check failed.',
+        };
+    }
+}
+
+const reviewedInvoices = computed(() => invoices.value.filter((invoice) => invoice.reviewed_at));
+const selectedBankCheck = computed(() => (selected.value ? bankCheckResults.value[selected.value.id] : null));
+const correctedBankCount = computed(
+    () => Object.values(bankCheckResults.value).filter((result) => result.autoCorrected).length,
+);
+
+async function checkAllBankCoding() {
+    if (checkingBank.value || !reviewedInvoices.value.length) return;
+
+    checkingBank.value = true;
+    aiError.value = '';
+    bankCheckProgress.value = { completed: 0, total: reviewedInvoices.value.length };
+
+    for (const invoice of reviewedInvoices.value) {
+        await checkBankCoding(invoice);
+        bankCheckProgress.value.completed += 1;
+    }
+
+    checkingBank.value = false;
 }
 
 async function save() {
@@ -247,16 +370,31 @@ async function save() {
             </div>
             <button
                 class="rounded bg-fg-dark-blue px-4 py-2 text-sm font-medium text-white hover:opacity-90 disabled:opacity-50"
-                :disabled="extracting || loading || !invoices.length"
+                :disabled="extracting || loading || !invoices.some((invoice) => !invoice.reviewed_at)"
                 @click="extractAllWithAi"
             >
                 {{
                     extracting
                         ? `Extracting ${extractionProgress.completed}/${extractionProgress.total}…`
-                        : 'Extract all invoices with AI'
+                        : `Extract pending invoices with AI (${invoices.filter((invoice) => !invoice.reviewed_at).length})`
                 }}
             </button>
+                <button
+                    class="rounded border border-fg-dark-blue px-4 py-2 text-sm font-medium text-fg-dark-blue hover:bg-fg-main-blue-9 disabled:opacity-50"
+                    :disabled="checkingBank || loading || !reviewedInvoices.length"
+                    @click="checkAllBankCoding"
+                >
+                    {{
+                        checkingBank
+                            ? `Checking ${bankCheckProgress.completed}/${bankCheckProgress.total}…`
+                            : `AI check all reviewed (${reviewedInvoices.length})`
+                    }}
+                </button>
         </div>
+
+            <p v-if="correctedBankCount" class="mb-3 rounded bg-fg-positive-9 p-2 text-xs text-fg-positive-dark">
+                AI corrected {{ correctedBankCount }} bank categor{{ correctedBankCount === 1 ? 'y' : 'ies' }}.
+            </p>
 
         <p v-if="loading" class="text-fg-light-grey">Loading…</p>
 
@@ -274,6 +412,9 @@ async function save() {
                         <span class="truncate font-mono text-xs">{{ invoice.filename }}</span>
                         <span v-if="invoice.entered_at" class="shrink-0 rounded-full bg-fg-positive-15 px-2 py-0.5 text-xs text-fg-positive-dark">
                             saved
+                        </span>
+                        <span v-if="invoice.reviewed_at" class="shrink-0 rounded-full bg-fg-positive-15 px-2 py-0.5 text-xs text-fg-positive-dark">
+                            manually reviewed
                         </span>
                         <span v-else-if="aiDrafts[invoice.id] && !aiDrafts[invoice.id].error" class="shrink-0 rounded-full bg-fg-main-blue-9 px-2 py-0.5 text-xs text-fg-dark-blue">
                             AI ready
@@ -313,6 +454,27 @@ async function save() {
                 <p v-if="aiError" class="mb-3 rounded bg-fg-danger-9 p-2 text-xs text-fg-danger-dark">
                     {{ aiError }}
                 </p>
+                <div v-if="selected.reviewed_at" class="mb-3 rounded border border-fg-muted-grey p-2">
+                    <p class="text-xs text-fg-positive-dark">Status: manually reviewed</p>
+                    <div v-if="selectedBankCheck" class="mt-2 text-xs">
+                        <p v-if="selectedBankCheck.error" class="text-fg-danger-dark">
+                            {{ selectedBankCheck.error }}
+                        </p>
+                        <p v-else-if="selectedBankCheck.autoCorrected" class="text-fg-positive-dark">
+                            Corrected bank transaction #{{ selectedBankCheck.transaction.id }} to {{ selectedBankCheck.recommendedCategory.name }}.
+                        </p>
+                        <p v-else-if="selectedBankCheck.match_found && selectedBankCheck.category_consistent" class="text-fg-positive-dark">
+                            Bank category is consistent with this invoice.
+                        </p>
+                        <p v-else class="text-fg-warning-text">
+                            {{ selectedBankCheck.reason || 'No high-confidence correction was applied. Please review manually.' }}
+                        </p>
+                        <p v-if="selectedBankCheck.transaction" class="mt-1 text-fg-light-grey">
+                            Matched transaction: {{ selectedBankCheck.transaction.description }}
+                            ({{ money(selectedBankCheck.transaction.amount) }}) · confidence {{ selectedBankCheck.confidence }}
+                        </p>
+                    </div>
+                </div>
                 <div v-if="aiWarnings.length" class="mb-3 rounded bg-fg-warning-15 p-2 text-xs text-fg-warning-text">
                     <p class="font-medium">Review before saving:</p>
                     <ul class="mt-1 list-disc space-y-0.5 pl-4">

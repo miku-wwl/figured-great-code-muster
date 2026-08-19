@@ -35,6 +35,7 @@ class InvoiceController extends Controller
             'total' => $validated['total'],
             'category_id' => $validated['category_id'],
             'entered_at' => now(),
+            'reviewed_at' => now(),
         ]);
 
         // Re-entering an invoice replaces its lines rather than appending.

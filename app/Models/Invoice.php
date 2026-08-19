@@ -16,6 +16,7 @@ class Invoice extends Model
         'invoice_date' => 'date:Y-m-d',
         'total' => 'float',
         'entered_at' => 'datetime',
+        'reviewed_at' => 'datetime',
     ];
 
     public function lines(): HasMany
