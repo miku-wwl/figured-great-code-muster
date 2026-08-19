@@ -10,6 +10,7 @@ use Illuminate\Support\Facades\Route;
 
 // Page 1: Bank Coding
 Route::get('/bank-transactions', [BankTransactionController::class, 'index']);
+Route::post('/bank-transactions/{bankTransaction}/suggest-category', [BankTransactionController::class, 'suggest']);
 Route::patch('/bank-transactions/{bankTransaction}', [BankTransactionController::class, 'update']);
 
 // Page 2: Inbox

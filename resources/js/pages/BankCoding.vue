@@ -7,6 +7,10 @@ const categories = ref([]);
 const transactions = ref([]);
 const loading = ref(true);
 const savingId = ref(null);
+const suggestingId = ref(null);
+const suggestion = ref(null);
+const suggestionError = ref('');
+const saveError = ref('');
 
 const uncodedCount = computed(() => transactions.value.filter((t) => !t.category_id).length);
 
@@ -19,10 +23,59 @@ onMounted(async () => {
 
 async function saveCategory(transaction) {
     savingId.value = transaction.id;
-    await axios.patch(`/api/bank-transactions/${transaction.id}`, {
-        category_id: transaction.category_id,
-    });
-    savingId.value = null;
+    saveError.value = '';
+
+    try {
+        await axios.patch(`/api/bank-transactions/${transaction.id}`, {
+            category_id: transaction.category_id,
+        });
+        if (suggestion.value?.transactionId === transaction.id) {
+            suggestion.value = null;
+        }
+        return true;
+    } catch (error) {
+        saveError.value = error.response?.data?.message ?? error.response?.data?.error ?? error.message;
+        return false;
+    } finally {
+        savingId.value = null;
+    }
+}
+
+async function suggestCategory(transaction) {
+    if (transaction.category_id) return;
+
+    suggestingId.value = transaction.id;
+    suggestion.value = null;
+    suggestionError.value = '';
+
+    try {
+        const { data } = await axios.post(`/api/bank-transactions/${transaction.id}/suggest-category`);
+        suggestion.value = {
+            ...data.suggestion,
+            transactionId: transaction.id,
+        };
+    } catch (error) {
+        suggestionError.value = error.response?.data?.error ?? error.message;
+    } finally {
+        suggestingId.value = null;
+    }
+}
+
+async function acceptSuggestion(transaction) {
+    if (suggestion.value?.transactionId !== transaction.id) return;
+
+    const category = categories.value.find((item) => item.name === suggestion.value.category);
+    if (!category) {
+        suggestionError.value = 'The suggestion is not in the current category list.';
+        return;
+    }
+
+    const previousCategoryId = transaction.category_id;
+    transaction.category_id = category.id;
+    const saved = await saveCategory(transaction);
+    if (!saved) {
+        transaction.category_id = previousCategoryId;
+    }
 }
 </script>
 
@@ -40,6 +93,14 @@ async function saveCategory(transaction) {
                 {{ uncodedCount }} still to code
             </p>
         </div>
+
+        <p class="mb-4 text-xs text-fg-mid-grey">
+            AI suggestions are never saved automatically. Review the suggestion and click <strong>Accept suggestion</strong>
+            or continue using the category dropdown.
+        </p>
+
+        <p v-if="suggestionError" class="mb-4 rounded bg-fg-danger-9 p-3 text-sm text-fg-danger-dark">{{ suggestionError }}</p>
+        <p v-if="saveError" class="mb-4 rounded bg-fg-danger-9 p-3 text-sm text-fg-danger-dark">{{ saveError }}</p>
 
         <p v-if="loading" class="text-fg-light-grey">Loading…</p>
 
@@ -69,15 +130,47 @@ async function saveCategory(transaction) {
                             {{ money(txn.amount) }}
                         </td>
                         <td class="px-3 py-1.5">
-                            <select
-                                v-model="txn.category_id"
-                                class="w-48 rounded border border-fg-muted-grey bg-white px-2 py-1 text-sm"
-                                :disabled="savingId === txn.id"
-                                @change="saveCategory(txn)"
-                            >
-                                <option :value="null">— uncoded —</option>
-                                <option v-for="cat in categories" :key="cat.id" :value="cat.id">{{ cat.name }}</option>
-                            </select>
+                            <div class="space-y-2">
+                                <select
+                                    v-model="txn.category_id"
+                                    class="w-48 rounded border border-fg-muted-grey bg-white px-2 py-1 text-sm"
+                                    :disabled="savingId === txn.id"
+                                    @change="saveCategory(txn)"
+                                >
+                                    <option :value="null">— uncoded —</option>
+                                    <option v-for="cat in categories" :key="cat.id" :value="cat.id">{{ cat.name }}</option>
+                                </select>
+
+                                <button
+                                    v-if="!txn.category_id"
+                                    class="block rounded border border-fg-main-blue px-2 py-1 text-xs font-medium text-fg-main-blue hover:bg-fg-main-blue-9 disabled:opacity-50"
+                                    :disabled="suggestingId === txn.id || savingId === txn.id"
+                                    @click.stop="suggestCategory(txn)"
+                                >
+                                    {{ suggestingId === txn.id ? 'Suggesting…' : 'Suggest category' }}
+                                </button>
+
+                                <div
+                                    v-if="suggestion?.transactionId === txn.id && !txn.category_id"
+                                    class="max-w-xs rounded border border-fg-main-blue-30 bg-fg-main-blue-9 p-2 text-xs"
+                                >
+                                    <p class="font-semibold text-fg-dark-blue">AI suggestion: {{ suggestion.category }}</p>
+                                    <p class="mt-1 text-fg-mid-grey">
+                                        Confidence: {{ Math.round(Number(suggestion.confidence) * 100) }}%
+                                    </p>
+                                    <p class="mt-1 leading-snug text-fg-dark-grey">{{ suggestion.reason }}</p>
+                                    <p v-if="suggestion.requiresReview" class="mt-1 font-medium text-fg-warning-text">
+                                        Human review recommended
+                                    </p>
+                                    <button
+                                        class="mt-2 rounded bg-fg-main-blue px-2 py-1 font-medium text-white hover:bg-fg-main-blue-hover disabled:opacity-50"
+                                        :disabled="savingId === txn.id"
+                                        @click.stop="acceptSuggestion(txn)"
+                                    >
+                                        {{ savingId === txn.id ? 'Saving…' : 'Accept suggestion' }}
+                                    </button>
+                                </div>
+                            </div>
                         </td>
                     </tr>
                 </tbody>
