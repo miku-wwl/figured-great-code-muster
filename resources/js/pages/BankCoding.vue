@@ -15,14 +15,18 @@ const loadError = ref('');
 const batchRunning = ref(false);
 const batchCompleted = ref(0);
 const batchTotal = ref(0);
+const acceptingClearSuggestions = ref(false);
+const clearAcceptCompleted = ref(0);
+const clearAcceptTotal = ref(0);
+const clearAcceptSucceeded = ref(0);
+const clearAcceptFailures = ref(0);
 
 const BATCH_CONCURRENCY = 3;
 
 const uncodedTransactions = computed(() => transactions.value.filter((transaction) => !transaction.category_id));
 const uncodedCount = computed(() => uncodedTransactions.value.length);
-const suggestedCount = computed(
-    () => uncodedTransactions.value.filter((transaction) => suggestionResults.value[transaction.id]?.status === 'SUGGESTED').length,
-);
+const clearSuggestionTransactions = computed(() => uncodedTransactions.value.filter(isClearSuggestion));
+const suggestedCount = computed(() => clearSuggestionTransactions.value.length);
 const needsReviewCount = computed(
     () =>
         uncodedTransactions.value.filter((transaction) => suggestionResults.value[transaction.id]?.status === 'NEEDS_REVIEW')
@@ -46,6 +50,22 @@ onMounted(async () => {
 
 function suggestionFor(transactionId) {
     return suggestionResults.value[transactionId] ?? null;
+}
+
+function isClearSuggestion(transaction) {
+    const result = suggestionFor(transaction.id);
+    const confidence = Number(result?.suggestion?.confidence);
+    const threshold = Number(result?.confidenceThreshold);
+
+    return (
+        result?.status === 'SUGGESTED' &&
+        Boolean(result.suggestion) &&
+        result.suggestion.requiresReview === false &&
+        Number.isFinite(confidence) &&
+        Number.isFinite(threshold) &&
+        confidence >= threshold &&
+        categories.value.some((category) => category.name === result.suggestion.category)
+    );
 }
 
 function isSuggesting(transactionId) {
@@ -149,12 +169,12 @@ async function suggestUncoded() {
 
 async function acceptSuggestion(transaction) {
     const result = suggestionFor(transaction.id);
-    if (!result?.suggestion) return;
+    if (transaction.category_id || !result?.suggestion) return false;
 
     const category = categories.value.find((item) => item.name === result.suggestion.category);
     if (!category) {
         suggestionError.value = 'The suggestion is not in the current category list.';
-        return;
+        return false;
     }
 
     const previousCategoryId = transaction.category_id;
@@ -162,6 +182,35 @@ async function acceptSuggestion(transaction) {
     const saved = await saveCategory(transaction);
     if (!saved) {
         transaction.category_id = previousCategoryId;
+    }
+
+    return saved;
+}
+
+async function acceptClearSuggestions() {
+    if (acceptingClearSuggestions.value || batchRunning.value) return;
+
+    const targets = [...clearSuggestionTransactions.value];
+    if (targets.length === 0) return;
+
+    acceptingClearSuggestions.value = true;
+    clearAcceptCompleted.value = 0;
+    clearAcceptTotal.value = targets.length;
+    clearAcceptSucceeded.value = 0;
+    clearAcceptFailures.value = 0;
+
+    try {
+        for (const transaction of targets) {
+            const accepted = await acceptSuggestion(transaction);
+            if (accepted) {
+                clearAcceptSucceeded.value += 1;
+            } else {
+                clearAcceptFailures.value += 1;
+            }
+            clearAcceptCompleted.value += 1;
+        }
+    } finally {
+        acceptingClearSuggestions.value = false;
     }
 }
 </script>
@@ -176,13 +225,29 @@ async function acceptSuggestion(transaction) {
                     everything since is yours.
                 </p>
             </div>
-            <button
-                class="rounded bg-fg-main-blue px-4 py-1.5 text-sm font-medium whitespace-nowrap text-white hover:bg-fg-main-blue-hover disabled:cursor-not-allowed disabled:opacity-50"
-                :disabled="loading || batchRunning || uncodedCount === 0 || withoutSuggestionCount === 0"
-                @click="suggestUncoded"
-            >
-                {{ batchRunning ? `Suggesting ${batchCompleted}/${batchTotal}…` : 'Suggest uncoded' }}
-            </button>
+            <div class="flex flex-col items-end gap-2">
+                <button
+                    class="rounded bg-fg-main-blue px-4 py-1.5 text-sm font-medium whitespace-nowrap text-white hover:bg-fg-main-blue-hover disabled:cursor-not-allowed disabled:opacity-50"
+                    :disabled="loading || batchRunning || acceptingClearSuggestions || uncodedCount === 0 || withoutSuggestionCount === 0"
+                    @click="suggestUncoded"
+                >
+                    {{ batchRunning ? `Suggesting ${batchCompleted}/${batchTotal}…` : 'Suggest uncoded' }}
+                </button>
+                <button
+                    class="rounded border border-fg-main-blue bg-white px-4 py-1.5 text-sm font-medium whitespace-nowrap text-fg-main-blue hover:bg-fg-main-blue-9 disabled:cursor-not-allowed disabled:opacity-50"
+                    :disabled="loading || batchRunning || acceptingClearSuggestions || suggestedCount === 0"
+                    @click="acceptClearSuggestions"
+                >
+                    {{
+                        acceptingClearSuggestions
+                            ? `Accepting ${clearAcceptCompleted}/${clearAcceptTotal}…`
+                            : `Accept ${suggestedCount} clear suggestions`
+                    }}
+                </button>
+                <p class="max-w-64 text-right text-xs text-fg-mid-grey">
+                    High confidence, valid category, and no AI review flag. Needs review stays untouched.
+                </p>
+            </div>
         </div>
 
         <div class="mb-3 flex flex-wrap gap-2 text-xs font-medium">
@@ -194,8 +259,8 @@ async function acceptSuggestion(transaction) {
         </div>
 
         <p class="mb-3 text-xs text-fg-mid-grey">
-            AI suggestions are never saved automatically. Review the suggestion and click <strong>Accept suggestion</strong>
-            or continue using the category dropdown.
+            AI suggestions are never saved automatically. Accept clear suggestions in one action, review a row individually, or
+            continue using the category dropdown.
         </p>
 
         <p v-if="batchRunning" class="mb-4 rounded bg-fg-main-blue-9 p-3 text-sm text-fg-dark-blue">
@@ -205,7 +270,15 @@ async function acceptSuggestion(transaction) {
             v-else-if="batchTotal > 0 && batchCompleted === batchTotal"
             class="mb-4 rounded bg-fg-main-blue-9 p-3 text-sm text-fg-dark-blue"
         >
-            Suggestions complete. Nothing was saved — accept clear suggestions or review ambiguous transactions.
+            Suggestion run complete. Categories change only when you use an Accept button or the dropdown.
+        </p>
+        <p
+            v-if="clearAcceptTotal > 0 && !acceptingClearSuggestions"
+            class="mb-4 rounded bg-fg-main-blue-9 p-3 text-sm text-fg-dark-blue"
+        >
+            Accepted {{ clearAcceptSucceeded }} clear suggestions.
+            <span v-if="clearAcceptFailures > 0">{{ clearAcceptFailures }} could not be saved and remain uncoded.</span>
+            Needs-review transactions were left untouched.
         </p>
 
         <p v-if="loadError" class="mb-4 rounded bg-fg-danger-9 p-3 text-sm text-fg-danger-dark">{{ loadError }}</p>
