@@ -8,7 +8,7 @@ const transactions = ref([]);
 const loading = ref(true);
 const savingId = ref(null);
 const suggestingId = ref(null);
-const suggestion = ref(null);
+const suggestionResult = ref(null);
 const suggestionError = ref('');
 const saveError = ref('');
 
@@ -29,8 +29,8 @@ async function saveCategory(transaction) {
         await axios.patch(`/api/bank-transactions/${transaction.id}`, {
             category_id: transaction.category_id,
         });
-        if (suggestion.value?.transactionId === transaction.id) {
-            suggestion.value = null;
+        if (suggestionResult.value?.transactionId === transaction.id) {
+            suggestionResult.value = null;
         }
         return true;
     } catch (error) {
@@ -45,26 +45,44 @@ async function suggestCategory(transaction) {
     if (transaction.category_id) return;
 
     suggestingId.value = transaction.id;
-    suggestion.value = null;
+    suggestionResult.value = null;
     suggestionError.value = '';
 
     try {
         const { data } = await axios.post(`/api/bank-transactions/${transaction.id}/suggest-category`);
-        suggestion.value = {
-            ...data.suggestion,
+        suggestionResult.value = {
+            ...data,
             transactionId: transaction.id,
         };
     } catch (error) {
-        suggestionError.value = error.response?.data?.error ?? error.message;
+        const failure = error.response?.data;
+        if (failure?.status === 'NEEDS_REVIEW') {
+            suggestionResult.value = {
+                ...failure,
+                transactionId: transaction.id,
+            };
+        } else {
+            suggestionResult.value = {
+                status: 'NEEDS_REVIEW',
+                suggestion: null,
+                reviewReasons: [
+                    {
+                        code: 'suggestion_request_failure',
+                        message: 'The suggestion request failed. Choose a category manually or try again.',
+                    },
+                ],
+                transactionId: transaction.id,
+            };
+        }
     } finally {
         suggestingId.value = null;
     }
 }
 
 async function acceptSuggestion(transaction) {
-    if (suggestion.value?.transactionId !== transaction.id) return;
+    if (suggestionResult.value?.transactionId !== transaction.id || !suggestionResult.value.suggestion) return;
 
-    const category = categories.value.find((item) => item.name === suggestion.value.category);
+    const category = categories.value.find((item) => item.name === suggestionResult.value.suggestion.category);
     if (!category) {
         suggestionError.value = 'The suggestion is not in the current category list.';
         return;
@@ -151,23 +169,58 @@ async function acceptSuggestion(transaction) {
                                 </button>
 
                                 <div
-                                    v-if="suggestion?.transactionId === txn.id && !txn.category_id"
-                                    class="max-w-xs rounded border border-fg-main-blue-30 bg-fg-main-blue-9 p-2 text-xs"
+                                    v-if="suggestionResult?.transactionId === txn.id && !txn.category_id"
+                                    class="max-w-xs rounded border p-2 text-xs"
+                                    :class="
+                                        suggestionResult.status === 'SUGGESTED'
+                                            ? 'border-fg-main-blue-30 bg-fg-main-blue-9'
+                                            : 'border-fg-warning bg-fg-warning-15'
+                                    "
                                 >
-                                    <p class="font-semibold text-fg-dark-blue">AI suggestion: {{ suggestion.category }}</p>
-                                    <p class="mt-1 text-fg-mid-grey">
-                                        Confidence: {{ Math.round(Number(suggestion.confidence) * 100) }}%
+                                    <p
+                                        class="font-semibold"
+                                        :class="
+                                            suggestionResult.status === 'SUGGESTED'
+                                                ? 'text-fg-dark-blue'
+                                                : 'text-fg-warning-text'
+                                        "
+                                    >
+                                        {{ suggestionResult.status === 'SUGGESTED' ? 'Suggested' : 'Needs adviser review' }}
                                     </p>
-                                    <p class="mt-1 leading-snug text-fg-dark-grey">{{ suggestion.reason }}</p>
-                                    <p v-if="suggestion.requiresReview" class="mt-1 font-medium text-fg-warning-text">
-                                        Human review recommended
-                                    </p>
+
+                                    <template v-if="suggestionResult.suggestion">
+                                        <p class="mt-1 font-medium text-fg-dark-grey">
+                                            AI category: {{ suggestionResult.suggestion.category }}
+                                        </p>
+                                        <p class="mt-1 text-fg-mid-grey">
+                                            Confidence: {{ Math.round(Number(suggestionResult.suggestion.confidence) * 100) }}%
+                                        </p>
+                                        <p class="mt-1 leading-snug text-fg-dark-grey">
+                                            {{ suggestionResult.suggestion.reason }}
+                                        </p>
+                                    </template>
+
+                                    <ul v-if="suggestionResult.reviewReasons?.length" class="mt-1 list-disc pl-4 text-fg-warning-text">
+                                        <li v-for="reason in suggestionResult.reviewReasons" :key="reason.code">
+                                            {{ reason.message }}
+                                        </li>
+                                    </ul>
+
+                                    <p class="mt-1 text-fg-mid-grey">Nothing has been saved. You remain in control.</p>
+
                                     <button
+                                        v-if="suggestionResult.suggestion"
                                         class="mt-2 rounded bg-fg-main-blue px-2 py-1 font-medium text-white hover:bg-fg-main-blue-hover disabled:opacity-50"
                                         :disabled="savingId === txn.id"
                                         @click.stop="acceptSuggestion(txn)"
                                     >
-                                        {{ savingId === txn.id ? 'Saving…' : 'Accept suggestion' }}
+                                        {{
+                                            savingId === txn.id
+                                                ? 'Saving…'
+                                                : suggestionResult.status === 'SUGGESTED'
+                                                  ? 'Accept suggestion'
+                                                  : 'Accept after review'
+                                        }}
                                     </button>
                                 </div>
                             </div>

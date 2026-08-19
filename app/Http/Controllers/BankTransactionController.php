@@ -13,6 +13,10 @@ use RuntimeException;
 
 class BankTransactionController extends Controller
 {
+    private const STATUS_SUGGESTED = 'SUGGESTED';
+
+    private const STATUS_NEEDS_REVIEW = 'NEEDS_REVIEW';
+
     public function index(): JsonResponse
     {
         return response()->json([
@@ -40,16 +44,19 @@ class BankTransactionController extends Controller
             ], 422);
         }
 
+        $threshold = $this->reviewConfidenceThreshold();
+        if ($threshold === null) {
+            return $this->needsReviewResponse('configuration_error', 500);
+        }
+
         $categories = Category::orderBy('id')->pluck('name')->values()->all();
         if ($categories === []) {
-            return response()->json(['error' => 'No bank coding categories are configured.'], 500);
+            return $this->needsReviewResponse('categories_unavailable', 500, $threshold);
         }
 
         $apiKey = config('services.anthropic.key');
         if (! $apiKey || str_starts_with($apiKey, 'sk-ant-your-key')) {
-            return response()->json([
-                'error' => 'No Anthropic API key configured. Set ANTHROPIC_API_KEY in .env.',
-            ], 500);
+            return $this->needsReviewResponse('configuration_error', 500, $threshold);
         }
 
         $historicalExamples = BankTransaction::with('category')
@@ -104,17 +111,15 @@ class BankTransactionController extends Controller
         } catch (ConnectionException $e) {
             report($e);
 
-            return response()->json(['error' => 'Could not reach the Anthropic API.'], 502);
+            return $this->needsReviewResponse('api_failure', 502, $threshold);
         } catch (JsonException $e) {
             report($e);
 
-            return response()->json(['error' => 'Could not build the AI request.'], 500);
+            return $this->needsReviewResponse('request_build_failure', 500, $threshold);
         }
 
         if ($response->failed()) {
-            return response()->json([
-                'error' => $response->json('error.message') ?? 'Anthropic API request failed.',
-            ], $response->status());
+            return $this->needsReviewResponse('api_failure', 502, $threshold);
         }
 
         $text = collect($response->json('content'))
@@ -127,12 +132,27 @@ class BankTransactionController extends Controller
         } catch (RuntimeException $e) {
             report($e);
 
-            return response()->json([
-                'error' => 'AI returned an invalid bank coding suggestion.',
-            ], 502);
+            $reasonCode = in_array($e->getMessage(), ['invalid_category', 'malformed_ai_output'], true)
+                ? $e->getMessage()
+                : 'malformed_ai_output';
+
+            return $this->needsReviewResponse($reasonCode, 502, $threshold);
         }
 
-        return response()->json(['suggestion' => $suggestion]);
+        $reviewReasons = [];
+        if ($suggestion['confidence'] < $threshold) {
+            $reviewReasons[] = $this->reviewReason('confidence_below_threshold', $threshold);
+        }
+        if ($suggestion['requiresReview']) {
+            $reviewReasons[] = $this->reviewReason('ai_requires_review', $threshold);
+        }
+
+        return response()->json([
+            'status' => $reviewReasons === [] ? self::STATUS_SUGGESTED : self::STATUS_NEEDS_REVIEW,
+            'suggestion' => $suggestion,
+            'confidenceThreshold' => $threshold,
+            'reviewReasons' => $reviewReasons,
+        ]);
     }
 
     /** @return array{category:string,confidence:float,reason:string,requiresReview:bool} */
@@ -146,31 +166,21 @@ class BankTransactionController extends Controller
 
         try {
             $value = json_decode($text, true, 512, JSON_THROW_ON_ERROR);
-        } catch (JsonException $firstException) {
-            $start = strpos($text, '{');
-            $end = strrpos($text, '}');
-            if ($start === false || $end === false || $end <= $start) {
-                throw new RuntimeException('AI response did not contain a JSON object.', 0, $firstException);
-            }
-
-            try {
-                $value = json_decode(substr($text, $start, $end - $start + 1), true, 512, JSON_THROW_ON_ERROR);
-            } catch (JsonException $secondException) {
-                throw new RuntimeException('AI response contained invalid JSON.', 0, $secondException);
-            }
+        } catch (JsonException $e) {
+            throw new RuntimeException('malformed_ai_output', 0, $e);
         }
 
         if (! is_array($value)) {
-            throw new RuntimeException('AI response was not a JSON object.');
+            throw new RuntimeException('malformed_ai_output');
         }
 
         $required = ['category', 'confidence', 'reason', 'requiresReview'];
         if (array_diff($required, array_keys($value)) !== [] || array_diff(array_keys($value), $required) !== []) {
-            throw new RuntimeException('AI response did not match the required schema.');
+            throw new RuntimeException('malformed_ai_output');
         }
 
         if (! is_string($value['category']) || ! in_array($value['category'], $categories, true)) {
-            throw new RuntimeException('AI returned a category outside the database category list.');
+            throw new RuntimeException('invalid_category');
         }
 
         if (
@@ -178,15 +188,15 @@ class BankTransactionController extends Controller
             || $value['confidence'] < 0
             || $value['confidence'] > 1
         ) {
-            throw new RuntimeException('AI confidence must be a number from 0 to 1.');
+            throw new RuntimeException('malformed_ai_output');
         }
 
         if (! is_string($value['reason']) || trim($value['reason']) === '') {
-            throw new RuntimeException('AI reason must be a non-empty string.');
+            throw new RuntimeException('malformed_ai_output');
         }
 
         if (! is_bool($value['requiresReview'])) {
-            throw new RuntimeException('AI requiresReview must be a boolean.');
+            throw new RuntimeException('malformed_ai_output');
         }
 
         return [
@@ -194,6 +204,49 @@ class BankTransactionController extends Controller
             'confidence' => (float) $value['confidence'],
             'reason' => trim($value['reason']),
             'requiresReview' => $value['requiresReview'],
+        ];
+    }
+
+    private function reviewConfidenceThreshold(): ?float
+    {
+        $threshold = config('services.anthropic.review_confidence_threshold');
+
+        if (is_bool($threshold) || (! is_int($threshold) && ! is_float($threshold))) {
+            return null;
+        }
+
+        $threshold = (float) $threshold;
+
+        return $threshold >= 0 && $threshold <= 1 ? $threshold : null;
+    }
+
+    private function needsReviewResponse(string $reasonCode, int $httpStatus, ?float $threshold = null): JsonResponse
+    {
+        return response()->json([
+            'status' => self::STATUS_NEEDS_REVIEW,
+            'suggestion' => null,
+            'confidenceThreshold' => $threshold,
+            'reviewReasons' => [$this->reviewReason($reasonCode, $threshold)],
+        ], $httpStatus);
+    }
+
+    /** @return array{code:string,message:string} */
+    private function reviewReason(string $reasonCode, ?float $threshold): array
+    {
+        $thresholdPercent = $threshold === null ? null : (int) round($threshold * 100);
+
+        return [
+            'code' => $reasonCode,
+            'message' => match ($reasonCode) {
+                'confidence_below_threshold' => "Confidence is below the configured {$thresholdPercent}% threshold.",
+                'ai_requires_review' => 'The AI marked this transaction as requiring adviser judgement.',
+                'invalid_category' => 'The AI category is not in the current Category table.',
+                'malformed_ai_output' => 'The AI response could not be reliably parsed and validated.',
+                'api_failure' => 'The AI service was unavailable, so no category was proposed.',
+                'request_build_failure' => 'The AI request could not be built safely.',
+                'categories_unavailable' => 'No bank coding categories are currently configured.',
+                default => 'The AI safety configuration is invalid.',
+            },
         ];
     }
 }

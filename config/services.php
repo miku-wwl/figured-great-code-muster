@@ -16,6 +16,7 @@ return [
 
     'anthropic' => [
         'key' => env('ANTHROPIC_API_KEY'),
+        'review_confidence_threshold' => (float) env('BANK_CODING_REVIEW_CONFIDENCE_THRESHOLD', 0.8),
     ],
 
     'postmark' => [
