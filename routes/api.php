@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\AiController;
+use App\Http\Controllers\BankCodingEvaluationController;
 use App\Http\Controllers\BankTransactionController;
 use App\Http\Controllers\EmailController;
 use App\Http\Controllers\InvoiceController;
@@ -12,6 +13,9 @@ use Illuminate\Support\Facades\Route;
 Route::get('/bank-transactions', [BankTransactionController::class, 'index']);
 Route::post('/bank-transactions/{bankTransaction}/suggest-category', [BankTransactionController::class, 'suggest']);
 Route::patch('/bank-transactions/{bankTransaction}', [BankTransactionController::class, 'update']);
+
+// Developer evaluation: leave-one-out classification of official adviser-coded history.
+Route::post('/evaluation/bank-coding', BankCodingEvaluationController::class);
 
 // Page 2: Inbox
 Route::get('/emails', [EmailController::class, 'index']);
